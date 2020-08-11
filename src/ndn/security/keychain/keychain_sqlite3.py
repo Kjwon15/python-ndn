@@ -15,9 +15,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # -----------------------------------------------------------------------------
-import sqlite3
 from typing import Iterator
 from dataclasses import dataclass
+from sqlalchemy import create_engine
+from sqlalchemy.orm import scoped_session, sessionmaker
 from typing import Dict, Any, Mapping
 from ...encoding import FormalName, BinaryStr, NonStrictName, Name
 from ...app_support.security_v2 import self_sign
@@ -273,36 +274,32 @@ class KeychainSqlite3(Keychain):
 
     def __init__(self, path: str, tpm: Tpm):
         self.path = path
-        self.conn = sqlite3.connect(path)
-        cursor = self.conn.execute('SELECT tpm_locator FROM tpmInfo')
-        self.tpm_locator = cursor.fetchone()[0]
-        cursor.close()
+        # self.conn = sqlite3.connect(path)
+        self.s_session = scoped_session(sessionmaker(bind=create_engine(f'sqlite:///{self.path}')))
+        with self.s_session() as session:
+            res = session.execute('SELECT tpm_locator FROM tpmInfo')
+            self.tpm_locator = res.fetchone()[0]
         self.tpm = tpm
         self._signer_cache = {}
 
     def __iter__(self) -> Iterator[FormalName]:
-        cursor = self.conn.execute('SELECT identity FROM identities')
-        while True:
-            name = cursor.fetchone()
-            if not name:
-                break
-            yield Name.from_bytes(name[0])
-        cursor.close()
+        with self.s_session() as session:
+            for row in session.execute('SELECT identity FROM identities'):
+                name = row[0]
+                yield Name.from_bytes(name)
 
     def __len__(self) -> int:
-        cursor = self.conn.execute('SELECT count(*) FROM identities')
-        ret = cursor.fetchone()[0]
-        cursor.close()
-        return ret
+        with self.s_session() as session:
+            return session.execute('SELECT count(*) FROM identities').fetchone()[0]
 
     def __getitem__(self, name: NonStrictName) -> Identity:
         name = Name.to_bytes(name)
-        cursor = self.conn.execute('SELECT id, identity, is_default FROM identities WHERE identity=?', (name,))
-        data = cursor.fetchone()
+        with self.s_session() as session:
+            res = session.execute('SELECT id, identity, is_default from identities where identity=:id', {'id': name})
+            data = res.fetchone()
         if not data:
             raise KeyError(name)
         row_id, identity, is_default = data
-        cursor.close()
         return Identity(self, row_id, Name.from_bytes(identity), is_default != 0)
 
     def has_default_identity(self) -> bool:
@@ -310,10 +307,9 @@ class KeychainSqlite3(Keychain):
         Whether there is a default Identity.
         :return: ``True`` if there is one.
         """
-        cursor = self.conn.execute('SELECT id FROM identities WHERE is_default=1')
-        ret = cursor.fetchone() is not None
-        cursor.close()
-        return ret
+        with self.s_session() as session:
+            res = session.execute('SELECT id FROM identities WHERE is_default=1')
+            return res.fetchone() is not None
 
     def set_default_identity(self, name: NonStrictName):
         """
@@ -323,8 +319,8 @@ class KeychainSqlite3(Keychain):
         :type name: :any:`NonStrictName`
         """
         name = Name.to_bytes(name)
-        self.conn.execute('UPDATE identities SET is_default=1 WHERE identity=?', (name,))
-        self.conn.commit()
+        with self.s_session() as session:
+            session.execute('UPDATE identities SET is_default=1 WHERE identity=:id', {'id': name})
 
     def default_identity(self) -> Identity:
         """
@@ -332,12 +328,11 @@ class KeychainSqlite3(Keychain):
 
         :return: the default Identity.
         """
-        cursor = self.conn.execute('SELECT id, identity, is_default FROM identities WHERE is_default=1')
-        data = cursor.fetchone()
+        with self.s_session() as session:
+            data = session.execute('SELECT id, identity, is_default FROM identities WHERE is_default=1').fetchone()
         if not data:
             raise KeyError('No default identity')
         row_id, identity, is_default = data
-        cursor.close()
         return Identity(self, row_id, Name.from_bytes(identity), is_default != 0)
 
     def new_identity(self, name: NonStrictName) -> Identity:
@@ -351,8 +346,8 @@ class KeychainSqlite3(Keychain):
         """
         name = Name.to_bytes(name)
         if name not in self:
-            self.conn.execute('INSERT INTO identities (identity) VALUES (?)', (name,))
-            self.conn.commit()
+            with self.s_session() as session:
+                session.execute('INSERT INTO identities (identity) VALUES (:name)', {'name': name})
         else:
             raise KeyError(f'Identity {Name.to_str(name)} already exists')
         if not self.has_default_identity():
@@ -370,8 +365,8 @@ class KeychainSqlite3(Keychain):
         """
         name = Name.to_bytes(id_name)
         if name not in self:
-            self.conn.execute('INSERT INTO identities (identity) VALUES (?)', (name,))
-            self.conn.commit()
+            with self.s_session() as session:
+                session.execute('INSERT INTO identities (identity) VALUES (:name)', {'name': name})
             self.new_key(name)
         if not self.has_default_identity():
             self.set_default_identity(name)
@@ -381,7 +376,7 @@ class KeychainSqlite3(Keychain):
         """
         Close the connection.
         """
-        self.conn.close()
+        self.s_session.remove()
 
     def del_identity(self, name: NonStrictName):
         """
@@ -393,8 +388,8 @@ class KeychainSqlite3(Keychain):
         name = Name.to_bytes(name)
         for key_name in self[name]:
             self.tpm.delete_key(key_name)
-        self.conn.execute('DELETE FROM identities WHERE identity=?', (name,))
-        self.conn.commit()
+        with self.s_session() as session:
+            session.execute('DELETE FROM identities WHERE identity=:name', {'name': name})
         self._signer_cache = {}
 
     def get_signer(self, sign_args: Dict[str, Any]):
@@ -431,8 +426,8 @@ class KeychainSqlite3(Keychain):
         """
         formal_name = Name.normalize(name)
         name = Name.to_bytes(name)
-        self.conn.execute('DELETE FROM keys WHERE key_name=?', (name,))
-        self.conn.commit()
+        with self.s_session() as session:
+            session.execute('DELETE FROM keys WHERE key_name=:name', {'name': name})
         self.tpm.delete_key(formal_name)
         self._signer_cache = {}
 
@@ -444,8 +439,8 @@ class KeychainSqlite3(Keychain):
         :type name: :any:`NonStrictName`
         """
         name = Name.to_bytes(name)
-        self.conn.execute('DELETE FROM certificates WHERE certificate_name=?', (name,))
-        self.conn.commit()
+        with self.s_session() as session:
+            session.execute('DELETE FROM certificates WHERE certificate_name=:name', {'name': name})
         self._signer_cache = {}
 
     def new_key(self, id_name: NonStrictName, key_type: str = 'ec', **kwargs) -> Key:
@@ -479,12 +474,12 @@ class KeychainSqlite3(Keychain):
         cert_name, cert_data = self_sign(key_name, pub_key, signer)
         key_name = Name.to_bytes(key_name)
         cert_name = Name.to_bytes(cert_name)
-        self.conn.execute('INSERT INTO keys (identity_id, key_name, key_bits) VALUES (?, ?, ?)',
-                          (identity.row_id, key_name, pub_key))
-        self.conn.execute('INSERT INTO certificates (key_id, certificate_name, certificate_data)'
-                          'VALUES ((SELECT id FROM keys WHERE key_name=?), ?, ?)',
-                          (key_name, cert_name, bytes(cert_data)))
-        self.conn.commit()
+        with self.s_session() as session:
+            session.execute('INSERT INTO keys (identity_id, key_name, key_bits) VALUES (:rowid, :keyname, :pubkey)',
+                            {'rowid': identity.row_id, 'keyname': key_name, 'pubkey': pub_key})
+            session.execute('INSERT INTO certificates (key_id, certificate_name, certificate_data)'
+                            'VALUES ((SELECT id FROM keys WHERE key_name=:keyname), :certname, :certdata)',
+                            {'keyname': key_name, 'certname': cert_name, 'certdata': bytes(cert_data)})
 
         if not identity.has_default_key():
             identity.set_default_key(key_name)
